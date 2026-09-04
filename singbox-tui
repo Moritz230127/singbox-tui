@@ -1,0 +1,915 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+singbox-tui v4.7 — vim 模式 · 单屏全模块控制台
+=============================================
+布局: 提示栏(最上) + 控制台四列(指示器|控制|流量|节点) + 日志(底部)
+交互: vim 三态 (normal / edit / command)
+  :start 开启代理  :stop 关闭代理  :mode 模式切换  :node 节点选择(DataTable)
+  :speed 全部测速  :refresh 刷新   :wq 保存退出    :q 不保存退出
+  :iface/:subscribe/:backup/:rules-update/:udp/:env/:guard/:log 配套脚本集成
+  ↑↓ 模块/选项切换  Enter 确认  Esc 保存退出编辑  q 退出
+鼠标: 滚轮仅日志滚动 | 终端 <100x20 显示 too-small 提示
+"""
+import asyncio
+import os
+import sys
+
+"""数据层内联"""
+"""singbox-tui v4 数据层 — 异步核心（clash_api / journal / speedtest / config）"""
+import asyncio
+import json
+import os
+import time
+
+API = "http://127.0.0.1:9090"
+PROXY_PORT = 7897
+CONFIG_PATH = os.path.expanduser("~/.config/singbox-tui/config.json")
+SECRET_PATH = os.path.expanduser("~/.config/singbox-tui.secret")
+
+# ---------- 配置持久化 ----------
+
+DEFAULT_CONFIG = {
+    "mode": "auto",
+    "node": "vless-v6",
+    "vps_ip": "YOUR_VPS_IP",
+    "speed_urls": [
+        ("Cloudflare 10MB", "https://speed.cloudflare.com/__down?bytes=10000000"),
+        ("Cloudflare 100MB", "https://speed.cloudflare.com/__down?bytes=100000000"),
+        ("ArchLinux 镜像", "https://mirrors.kernel.org/archlinux/iso/latest/archlinux-x86_64.iso.zst"),
+    ],
+}
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+        for k, v in DEFAULT_CONFIG.items():
+            cfg.setdefault(k, v)
+        return cfg
+    except Exception:
+        return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg):
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+# ---------- clash API（asyncio + curl 子进程） ----------
+
+def _api_auth():
+    try:
+        secret = open(SECRET_PATH).read().strip()
+        return ["-H", "Authorization: Bearer %s" % secret] if secret else []
+    except Exception:
+        return []
+
+
+async def _curl(args, timeout=8):
+    """执行 curl 子进程，返回 (returncode, stdout)"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "curl", "-s", "--max-time", str(timeout), *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout + 3)
+        return proc.returncode, out.decode(errors="replace").strip()
+    except Exception:
+        return None, ""
+
+
+async def api_get(path, timeout=5):
+    rc, out = await _curl(_api_auth() + [API + path], timeout)
+    if rc == 0 and out:
+        try:
+            return json.loads(out)
+        except Exception:
+            return None
+    return None
+
+
+async def api_put(path, data, timeout=5):
+    rc, _ = await _curl(["-X", "PUT", API + path, "-d", data] + _api_auth(), timeout)
+    return rc == 0
+
+
+async def get_proxy_state():
+    """返回 (当前选中, auto 组选中)"""
+    p = await api_get("/proxies/proxy")
+    a = await api_get("/proxies/auto")
+    return (p.get("now", "—") if p else "—"), (a.get("now", "—") if a else "—")
+
+
+async def get_nodes():
+    """从 clash API 动态获取节点列表（修复 v3 硬编码）"""
+    p = await api_get("/proxies/proxy")
+    if p and "all" in p:
+        return p["all"]
+    return ["auto", "vless-v6", "vless-v4", "tuic-v6", "tuic-v4", "hy2-v6", "hy2-v4"]
+
+
+async def node_delay(tag, timeout=6):
+    """单节点延迟(ms)，失败返回 None"""
+    url = "/proxies/%s/delay?timeout=5000&url=http%%3A%%2F%%2Fwww.gstatic.com%%2Fgenerate_204" % tag
+    d = await api_get(url, timeout=timeout)
+    if d and "delay" in d:
+        return d["delay"]
+    return None
+
+
+async def set_proxy(name):
+    """切换节点/模式（clash API PUT，即时生效）"""
+    return await api_put("/proxies/proxy", '{"name":"%s"}' % name)
+
+
+async def ping_vps(ip, port=443, timeout=5):
+    """TCP connect 测 VPS 直连延迟(ms)，失败返回 None"""
+    t0 = time.time()
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), timeout=timeout)
+        writer.close()
+        await writer.wait_closed()
+        return int((time.time() - t0) * 1000)
+    except Exception:
+        return None
+
+
+async def get_traffic():
+    """/traffic 累计字节 (up, down)"""
+    d = await api_get("/traffic", timeout=3)
+    if d:
+        return d.get("up", 0), d.get("down", 0)
+    return 0, 0
+
+
+async def get_version():
+    """sing-box 版本"""
+    d = await api_get("/version", timeout=3)
+    if d and "version" in d:
+        return d["version"]
+    return "—"
+
+
+async def get_node_ips():
+    """从 config.json outbounds 解析 tag→server:port（sudo -n cat）"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "-n", "cat", "/etc/sing-box/config.json",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        cfg = json.loads(out.decode())
+        ips = {}
+        for ob in cfg.get("outbounds", []):
+            if ob.get("type") in ("vless", "tuic", "hysteria2") and ob.get("tag"):
+                ips[ob["tag"]] = "%s:%s" % (ob.get("server", "?"), ob.get("server_port", "?"))
+        return ips
+    except Exception:
+        return {}
+
+
+async def get_default_iface():
+    """默认路由网卡"""
+    proc = await asyncio.create_subprocess_exec(
+        "ip", "route", "show", "default",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await proc.communicate()
+    line = out.decode().strip()
+    if "dev " in line:
+        return line.split("dev ")[1].split()[0]
+    return "—"
+
+
+async def run_script(script, *args, timeout=120):
+    """调配套脚本，返回输出（失败返回空串）"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            os.path.expanduser("~/.local/bin/" + script), *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return out.decode(errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def fmt_bytes(n):
+    """人类可读字节"""
+    try:
+        n = float(n)
+    except Exception:
+        return "0B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return "%.1f%s" % (n, unit) if unit != "B" else "%d%s" % (int(n), unit)
+        n /= 1024
+    return "%d%s" % (int(n), "TB")
+
+
+# ---------- 服务状态 ----------
+
+async def is_active():
+    proc = await asyncio.create_subprocess_exec(
+        "systemctl", "is-active", "sing-box",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await proc.communicate()
+    return out.decode().strip() == "active"
+
+
+async def service(action):
+    proc = await asyncio.create_subprocess_exec(
+        "sudo", "-n", "systemctl", action, "sing-box",
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    await proc.communicate()
+
+
+async def egress():
+    rc, out = await _curl(["-4", "https://api.ipify.org"], 6)
+    return out if rc == 0 else "—"
+
+
+async def err_warn_count(hours=1):
+    proc = await asyncio.create_subprocess_exec(
+        "journalctl", "-u", "sing-box", "--since", "%d hours ago" % hours, "--no-pager",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await proc.communicate()
+    try:
+        return sum(1 for line in out.decode(errors="replace").splitlines()
+                   if "ERROR" in line or "WARNING" in line)
+    except Exception:
+        return 0
+
+
+async def uptime_str():
+    proc = await asyncio.create_subprocess_exec(
+        "systemctl", "show", "sing-box", "-p", "ActiveEnterTimestamp", "--value",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await proc.communicate()
+    ts = out.decode().strip()
+    if not ts:
+        return "—"
+    try:
+        t = time.mktime(time.strptime(ts, "%a %Y-%m-%d %H:%M:%S %Z"))
+        secs = max(0, int(time.time() - t))
+    except Exception:
+        return "—"
+    d, rem = divmod(secs, 86400)
+    h, m = divmod(rem, 3600)
+    m, _ = divmod(m, 60)
+    if d > 0:
+        return "%d天%d时" % (d, h)
+    if h > 0:
+        return "%d时%d分" % (h, m)
+    return "%d分" % m
+
+
+async def conn_count(vps_ip):
+    """连接数：ss 统计到 VPS 的 TCP 连接（IP 从配置读取，修复 v3 硬编码）"""
+    proc = await asyncio.create_subprocess_exec(
+        "ss", "-tn",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await proc.communicate()
+    return sum(1 for line in out.decode(errors="replace").splitlines()
+               if vps_ip in line and ":443" in line)
+
+
+# ---------- 测速 ----------
+
+async def speed_test(url, timeout=45):
+    """经 mixed 代理下载测速，返回 (MB/s, 耗时s) 或 None"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "curl", "-s", "-x", "http://127.0.0.1:%d" % PROXY_PORT,
+            "--max-time", str(timeout), "-o", "/dev/null",
+            "-w", "%{speed_download} %{time_total}", url,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout + 5)
+        if proc.returncode == 0 and out:
+            speed, total = out.decode().split()
+            return float(speed) / 1048576, float(total)
+    except Exception:
+        pass
+    return None
+
+
+async def udp_health():
+    """UDP 链路丢包率检测（复用 singbox-udp-health）"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            os.path.expanduser("~/.local/bin/singbox-udp-health"), "8",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=90)
+        lines = out.decode(errors="replace").strip().splitlines()
+        return lines[-1] if lines else "检测失败"
+    except Exception:
+        return "检测失败"
+
+
+# ---------- 日志流 ----------
+
+async def journal_stream(callback, stop_event):
+    """journalctl -f 异步流，逐行回调。stop_event 置位时退出。"""
+    proc = await asyncio.create_subprocess_exec(
+        "journalctl", "-u", "sing-box", "-f", "--no-pager", "-o", "short-iso",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    if proc.stdout is None:
+        return
+    try:
+        while not stop_event.is_set():
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            result = callback(line.decode(errors="replace").rstrip())
+            if asyncio.iscoroutine(result):
+                await result
+    finally:
+        proc.kill()
+        await proc.wait()
+
+
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical
+from textual.widgets import Static, RichLog, DataTable
+from textual.coordinate import Coordinate
+from textual.theme import Theme
+from rich.markup import escape
+import unicodedata
+
+
+NOCTALIA = dict(
+    name="noctalia",
+    primary="#8fbcbb",
+    secondary="#5e81ac",
+    warning="#ebcb8b",
+    error="#bf616a",
+    success="#a3be8c",
+    accent="#88c0d0",
+    foreground="#eceff4",
+    background="#2e3440",
+    surface="#3b4252",
+    panel="#3b4252",
+    boost="#4c556a",
+    dark=True,
+)
+
+
+import re
+
+MARKUP_RE = re.compile(r"\[[^\]]*\]")
+
+
+def _plain(s):
+    """剥离 markup 标签（如 [red]失败[/red] → 失败）"""
+    return MARKUP_RE.sub("", s)
+
+
+def pad(s, w):
+    """按显示宽度右补空格（CJK=2，剥离 markup 标签），用于列对齐"""
+    plain = _plain(s)
+    width = sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in plain)
+    return s + " " * max(0, w - width)
+
+
+def truncate(s, w):
+    """按显示宽度截断（不切半个 CJK 字符，保留 markup 标签）"""
+    width = 0
+    out = []
+    for c in s:
+        cw = 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+        if width + cw > w:
+            break
+        out.append(c)
+        width += cw
+    return "".join(out)
+
+CSS = """
+App { background: $background; }
+Screen { layout: vertical; background: $background; }
+Static, RichLog, Vertical, Horizontal { background: transparent; }
+#hint { height: 2; color: $text-muted; padding: 0 1; }
+#console { height: 10; }
+.panel { border: round $primary; border-title-color: $accent; padding: 0 1; margin: 0 1 0 0; height: 100%; }
+.panel.focused { border: round $accent; }
+#indicator-panel { width: 3fr; min-width: 24; }
+#power-mode-panel { width: 1.5fr; min-width: 12; }
+#traffic-panel { width: 2fr; min-width: 14; }
+#node-panel { width: 5fr; min-width: 30; }
+#node { text-wrap: nowrap; }
+.panel-title { color: $accent; text-style: bold; }
+#log { height: 1fr; border: round $primary; border-title-color: $accent; }
+#cmdline { height: 1; color: $text; }
+#too-small { display: none; height: 1fr; content-align: center middle; color: $error; text-style: bold; }
+"""
+
+MODULES = ["indicator-panel", "power-mode-panel", "traffic-panel", "node-panel", "log"]
+
+
+class SingboxApp(App):
+    CSS = CSS
+    TITLE = "sing-box 控制台"
+
+    def __init__(self):
+        super().__init__()
+        self.ui_mode = "normal"       # normal / edit / command
+        self.edit_target = None       # "mode" | "node"
+        self.focus_idx = 0            # normal 模式模块焦点
+        self.cmd_buf = ""
+        self.cfg = load_config()
+        self.nodes = []
+        self.state = {"active": False, "proxy": "—", "auto": "—", "egress": "—",
+                      "err1h": "—", "conns": "—", "uptime": "—"}
+        self.lat = {}                 # 节点链路延迟
+        self.ping = None              # VPS 直连延迟 (ms)
+        self.speed = {}               # 节点下载速度 (MB/s)
+        self.speed_tested = set()    # 已测速节点
+        self.download = "—"
+        self.udp = "—"
+        self.block_count = 0          # block 拒绝计数（1h 窗口）
+        self.node_ips = {}            # 节点 tag→server:port
+        self.version = "—"            # sing-box 版本
+        self.iface = "—"              # 默认网卡
+        self.traffic_up = 0           # 累计上传字节
+        self.traffic_down = 0
+        self.rate_up = 0.0            # 实时速率 B/s
+        self.rate_down = 0.0
+        self._last_traffic = None
+        self._last_traffic_t = 0.0
+        self.node_sel = 0
+        self.mode_sel = 0
+        self.log_follow = True
+        self.log_filter = "all"       # all / error / warn
+        self._log_stop = asyncio.Event()
+        self._speed_running = False
+        self._err_tick = 0
+
+    # ---------- 布局 ----------
+    def compose(self) -> ComposeResult:
+        yield Static("", id="hint")
+        with Horizontal(id="console"):
+            with Vertical(id="indicator-panel", classes="panel"):
+                yield Static("", id="indicator")
+            with Vertical(id="power-mode-panel", classes="panel"):
+                yield Static("", id="power")
+                yield Static("", id="mode")
+            with Vertical(id="traffic-panel", classes="panel"):
+                yield Static("", id="traffic")
+            with Vertical(id="node-panel", classes="panel"):
+                yield DataTable(id="node-table")
+        yield RichLog(id="log", markup=True, auto_scroll=True, wrap=True, max_lines=500)
+        yield Static("", id="cmdline")
+        yield Static("终端太小，请放大窗口（建议 ≥100x20）", id="too-small")
+
+    # ---------- 生命周期 ----------
+    async def on_mount(self):
+        self.register_theme(Theme(**NOCTALIA))
+        self.theme = "noctalia"
+        # btop 风格边框标题
+        self.query_one("#indicator-panel").border_title = "状态指示器"
+        self.query_one("#power-mode-panel").border_title = "控制"
+        self.query_one("#traffic-panel").border_title = "流量"
+        self.query_one("#node-panel").border_title = "节点"
+        self.query_one("#log").border_title = "日志"
+        # 初始化节点表格
+        dt = self.query_one("#node-table")
+        self.col_node = dt.add_column("节点", width=12)
+        self.col_ip = dt.add_column("IP", width=20)
+        self.col_ping = dt.add_column("ping", width=5)
+        self.col_link = dt.add_column("链路", width=5)
+        self.col_speed = dt.add_column("速度", width=4)
+        dt.cursor_type = "row"
+        dt.zebra_stripes = True
+        self.nodes = await get_nodes()
+        self.row_keys = {}
+        for n in self.nodes:
+            self.row_keys[n] = dt.add_row("", "", "", "", "", key=n)
+        cur = self.state.get("proxy")
+        if cur in self.nodes:
+            self.node_sel = self.nodes.index(cur)
+        # 读取节点 IP / 版本 / 网卡（启动时缓存）
+        self.node_ips = await get_node_ips()
+        self.version = await get_version()
+        self.iface = await get_default_iface()
+        # 恢复上次 :wq 保存的状态
+        if self.cfg["mode"] == "manual" and self.cfg["node"] in self.nodes:
+            await set_proxy(self.cfg["node"])
+        elif self.cfg["mode"] == "auto":
+            await set_proxy("auto")
+        asyncio.create_task(self.poll_state())
+        asyncio.create_task(journal_stream(self.on_log_line, self._log_stop))
+        self.log_inject("TUI 启动 (模式: %s)" % self.cfg["mode"])
+        asyncio.create_task(self.refresh_once())  # 启动即刷新状态
+        self.refresh_panels()
+
+    def on_unmount(self):
+        self._log_stop.set()
+
+    def on_resize(self, event):
+        """终端过小时显示提示（btop 风格），隐藏主界面"""
+        w, h = event.size.width, event.size.height
+        too_small = w < 100 or h < 20
+        self.query_one("#too-small").display = too_small
+        self.query_one("#hint").display = not too_small
+        self.query_one("#console").display = not too_small
+        self.query_one("#log").display = not too_small
+        self.query_one("#cmdline").display = not too_small
+
+    # ---------- 后台任务 ----------
+    async def poll_state(self):
+        while True:
+            try:
+                self.state["active"] = await is_active()
+                if self.state["active"]:
+                    p, a = await get_proxy_state()
+                    self.state["proxy"], self.state["auto"] = p, a
+                    self.state["conns"] = await conn_count(self.cfg["vps_ip"])
+                    self.state["uptime"] = await uptime_str()
+                    # 流量轮询（每 2s 计算速率）
+                    up, down = await get_traffic()
+                    now = time.time()
+                    if self._last_traffic is not None:
+                        dt = now - self._last_traffic_t
+                        if dt > 0:
+                            self.rate_up = max(0, (up - self._last_traffic[0]) / dt)
+                            self.rate_down = max(0, (down - self._last_traffic[1]) / dt)
+                    self._last_traffic = (up, down)
+                    self._last_traffic_t = now
+                    self.traffic_up, self.traffic_down = up, down
+                    self._err_tick += 1
+                    if self._err_tick % 5 == 0:  # 每 10s 重操作
+                        self.state["egress"] = await egress()
+                        self.state["err1h"] = await err_warn_count(1)
+                self.refresh_panels()
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+
+    async def refresh_once(self):
+        self.state["active"] = await is_active()
+        if self.state["active"]:
+            p, a = await get_proxy_state()
+            self.state["proxy"], self.state["auto"] = p, a
+            self.state["egress"] = await egress()
+            self.state["err1h"] = await err_warn_count(1)
+            self.state["conns"] = await conn_count(self.cfg["vps_ip"])
+            self.state["uptime"] = await uptime_str()
+        self.refresh_panels()
+
+    async def run_speedtest(self):
+        if self._speed_running:
+            return
+        self._speed_running = True
+        self.udp = "—"
+        self.download = "测速中..."
+        self.refresh_panels()
+        # 记录原节点，测速后恢复
+        orig = self.state.get("proxy", "auto")
+        # 1. 并行测 ping（VPS 直连）+ 链路延迟（clash API）
+        vps_ip = self.cfg["vps_ip"]
+        ping_task = asyncio.create_task(ping_vps(vps_ip))
+        lat_tasks = [node_delay(n) for n in self.nodes]
+        lat_results = await asyncio.gather(*lat_tasks)
+        self.lat = dict(zip(self.nodes, lat_results))
+        self.ping = await ping_task
+        # 2. 对每个具体节点依次切换测下载速度（链路延迟 None 的节点跳过，避免超时）
+        name, url = self.cfg["speed_urls"][0]
+        for n in self.nodes:
+            if n == "auto":
+                continue
+            self.speed_tested.add(n)
+            self.download = "测速中: %s..." % n
+            self.refresh_panels()
+            await set_proxy(n)
+            if self.lat.get(n) is None:
+                self.speed[n] = None  # 节点不可达（如校园网 UDP 封禁），跳过下载
+                continue
+            r = await speed_test(url)
+            self.speed[n] = r[0] if r else None
+        # 3. 恢复原节点
+        await set_proxy(orig)
+        self.download = "完成"
+        # 4. UDP 链路健康
+        self.udp = await udp_health()
+        self._speed_running = False
+        self.log_inject("测速完成: ping %s, %d 节点, UDP %s" % (self.ping, len(self.nodes) - 1, self.udp))
+        await self.refresh_once()
+
+    # ---------- 日志 ----------
+    def on_log_line(self, line):
+        # block 拒绝：只计数不显示（避免刷屏），计数显示在状态指示器
+        if "outbound/block" in line or "operation not permitted" in line:
+            self.block_count += 1
+            return
+        # 日志过滤
+        if self.log_filter == "error" and "ERROR" not in line:
+            return
+        if self.log_filter == "warn" and "ERROR" not in line and "WARNING" not in line:
+            return
+        safe = escape(line)
+        safe = safe.replace("ERROR", "[bold red]ERROR[/bold red]")
+        safe = safe.replace("WARNING", "[bold yellow]WARNING[/bold yellow]")
+        self.query_one("#log", RichLog).write(safe)
+
+    def log_inject(self, msg):
+        self.query_one("#log", RichLog).write("[bold cyan][TUI][/bold cyan] " + msg)
+
+    # ---------- 面板渲染 ----------
+    def hint_text(self):
+        return ("[:start] [:stop] [:mode] [:node] [:speed] [:refresh] [:wq] [:q]\n"
+                "[:iface] [:subscribe] [:backup] [:rules-update] [:udp] [:env] [:guard] [:log]")
+
+    def log_title(self):
+        """日志边框标题（含过滤状态）"""
+        return "日志" + (" [%s]" % self.log_filter if self.log_filter != "all" else "")
+
+    def indicator_text(self):
+        s = self.state
+        active = s["active"]
+        st = "运行中" if active else "已停止"
+        st_style = "green" if active else "red"
+        mode = "自动" if s["proxy"] == "auto" else "手动"
+        return (f"[{st_style}]●[/{st_style}] {st} | {mode}\n"
+                f"{self.version}\n"
+                f"出口: {s['egress']}\n"
+                f"错误(1h): {s['err1h']} | 连接: {s['conns']}\n"
+                f"运行: {s['uptime']} | {self.iface}\n"
+                f"UDP: {self.udp}\n"
+                f"block: {self.block_count}")
+
+    def traffic_text(self):
+        return (f"↑ {fmt_bytes(self.rate_up)}/s\n"
+                f"↓ {fmt_bytes(self.rate_down)}/s\n"
+                f"总 ↑ {fmt_bytes(self.traffic_up)}\n"
+                f"总 ↓ {fmt_bytes(self.traffic_down)}")
+
+    def power_text(self):
+        active = self.state["active"]
+        return (f"开关: [{('green' if active else 'red')}]●[/]")
+
+    def mode_text(self):
+        cur = "auto" if self.state["proxy"] == "auto" else "manual"
+        lines = []
+        if self.ui_mode == "edit" and self.edit_target == "mode":
+            for i, m in enumerate(["自动", "手动"]):
+                mark = ">" if i == self.mode_sel else " "
+                if i == self.mode_sel:
+                    lines.append(f"{mark} [reverse]{m}[/]")
+                else:
+                    lines.append(f"{mark} {m}")
+        else:
+            lines.append("模式: " + ("自动" if cur == "auto" else "手动"))
+        return "\n".join(lines)
+
+    def refresh_node_table(self):
+        """更新节点表格（延迟/速度/IP）"""
+        dt = self.query_one("#node-table")
+        cur = self.state.get("proxy")
+        for i, n in enumerate(self.nodes):
+            ip = self.node_ips.get(n, "—")
+            ps = "—" if self.ping is None else "%dms" % self.ping
+            lat = self.lat.get(n)
+            ls = "—" if lat is None else "%dms" % lat
+            sp = self.speed.get(n)
+            if n in self.speed_tested:
+                ss = "—" if n == "auto" else ("失败" if sp is None else "%.1fM" % sp)
+            else:
+                ss = "—"
+            label = ("★ " if n == cur else "  ") + ("自动选优" if n == "auto" else n)
+            rk = self.row_keys.get(n)
+            if rk is None:
+                continue
+            dt.update_cell(rk, self.col_node, label)
+            dt.update_cell(rk, self.col_ip, ip)
+            dt.update_cell(rk, self.col_ping, ps)
+            dt.update_cell(rk, self.col_link, ls)
+            dt.update_cell(rk, self.col_speed, ss)
+        # 光标跟随当前节点（normal 模式）
+        if self.ui_mode != "edit":
+            if cur in self.nodes:
+                dt.cursor_coordinate = Coordinate(self.nodes.index(cur), 0)
+
+    def cmdline_text(self):
+        if self.ui_mode == "command":
+            return ":" + self.cmd_buf + "▌"
+        return ""
+
+    def refresh_panels(self):
+        self.query_one("#hint", Static).update(self.hint_text())
+        self.query_one("#indicator", Static).update(self.indicator_text())
+        self.query_one("#power", Static).update(self.power_text())
+        self.query_one("#mode", Static).update(self.mode_text())
+        self.query_one("#traffic", Static).update(self.traffic_text())
+        self.refresh_node_table()
+        self.query_one("#cmdline", Static).update(self.cmdline_text())
+        self.query_one("#log").border_title = self.log_title()
+        self.update_focus_border()
+
+    def update_focus_border(self):
+        for i, m in enumerate(MODULES):
+            w = self.query_one("#" + m)
+            w.set_class(i == self.focus_idx and self.ui_mode == "normal", "focused")
+
+    # ---------- 命令 ----------
+    def exec_command(self, cmd):
+        cmd = cmd.strip()
+        if cmd in ("start", "stop"):
+            asyncio.create_task(self.do_service(cmd))
+        elif cmd == "mode":
+            self.ui_mode = "edit"
+            self.edit_target = "mode"
+            self.mode_sel = 0 if self.state.get("proxy") == "auto" else 1
+            cur = self.state.get("proxy")
+            if cur in self.nodes:
+                self.node_sel = self.nodes.index(cur)
+        elif cmd == "node":
+            self.ui_mode = "edit"
+            self.edit_target = "node"
+            cur = self.state.get("proxy")
+            if cur in self.nodes:
+                self.node_sel = self.nodes.index(cur)
+            # 聚焦 DataTable，光标定位到当前节点
+            dt = self.query_one("#node-table")
+            dt.focus()
+            dt.cursor_coordinate = Coordinate(self.node_sel, 0)
+        elif cmd == "speed":
+            asyncio.create_task(self.run_speedtest())
+            self.ui_mode = "normal"
+        elif cmd == "refresh":
+            asyncio.create_task(self.refresh_once())
+            self.ui_mode = "normal"
+        elif cmd.startswith("iface"):
+            name = cmd.split()[1] if len(cmd.split()) > 1 else ""
+            if not name:
+                self.notify("用法: :iface <网卡名>")
+            else:
+                asyncio.create_task(self.run_script_cmd("singbox-switch-iface", [name], "网卡切换"))
+            self.ui_mode = "normal"
+        elif cmd.startswith("subscribe"):
+            args = ["--apply"] if "--apply" in cmd else []
+            asyncio.create_task(self.run_script_cmd("singbox-subscribe", args, "订阅同步"))
+            self.ui_mode = "normal"
+        elif cmd == "backup":
+            asyncio.create_task(self.run_script_cmd("singbox-vps-backup", [], "VPS 备份"))
+            self.ui_mode = "normal"
+        elif cmd == "rules-update":
+            asyncio.create_task(self.run_script_cmd("singbox-rules-update", [], "规则更新"))
+            self.ui_mode = "normal"
+        elif cmd == "udp":
+            asyncio.create_task(self.run_udp_check())
+            self.ui_mode = "normal"
+        elif cmd == "env":
+            asyncio.create_task(self.run_script_cmd("singbox-env-detect", [], "环境检测"))
+            self.ui_mode = "normal"
+        elif cmd == "guard":
+            asyncio.create_task(self.run_script_cmd("singbox", ["guard"], "健康守卫"))
+            self.ui_mode = "normal"
+        elif cmd.startswith("log"):
+            parts = cmd.split()
+            if len(parts) > 1 and parts[1] in ("error", "warn", "all"):
+                self.log_filter = parts[1]
+                self.log_inject("日志过滤: %s" % parts[1])
+            else:
+                self.notify("用法: :log error|warn|all")
+            self.ui_mode = "normal"
+        elif cmd == "wq":
+            self.save_and_exit()
+            return
+        elif cmd == "q":
+            self.exit()
+            return
+        else:
+            self.notify("未知命令: %s" % cmd)
+            self.ui_mode = "normal"
+        self.cmd_buf = ""
+        self.refresh_panels()
+
+    async def run_script_cmd(self, script, args, label):
+        """调配套脚本，输出注入日志（后台不阻塞）"""
+        self.log_inject("%s: 执行中..." % label)
+        out = await run_script(script, *args)
+        if out:
+            for line in out.splitlines()[:8]:
+                self.log_inject("%s: %s" % (label, line[:100]))
+        else:
+            self.log_inject("%s: 无输出或失败" % label)
+        if script == "singbox-switch-iface":
+            self.iface = await get_default_iface()
+        await self.refresh_once()
+
+    async def run_udp_check(self):
+        """UDP 健康检测，结果缓存显示"""
+        self.udp = "检测中..."
+        self.refresh_panels()
+        out = await run_script("singbox-udp-health", "8")
+        self.udp = out.splitlines()[-1][:20] if out else "检测失败"
+        self.log_inject("UDP 检测: %s" % self.udp)
+        self.refresh_panels()
+
+    async def do_service(self, action):
+        await service(action)
+        self.log_inject("已%s代理" % ("开启" if action == "start" else "关闭"))
+        await self.refresh_once()
+
+    async def confirm_edit(self):
+        if self.edit_target == "mode":
+            if self.mode_sel == 0:
+                ok = await set_proxy("auto")
+                self.log_inject("已切到自动模式" if ok else "切换失败")
+            else:
+                # 手动：保持当前节点（若 auto 则用 node_sel 或默认）
+                cur = self.state.get("proxy")
+                name = cur if cur != "auto" else (self.nodes[self.node_sel] if self.nodes else "vless-v6")
+                if name == "auto":
+                    name = "vless-v6"
+                ok = await set_proxy(name)
+                self.log_inject("已切到手动: %s" % name if ok else "切换失败")
+        elif self.edit_target == "node":
+            # 从 DataTable 光标读取选中节点
+            dt = self.query_one("#node-table")
+            row = dt.cursor_coordinate.row
+            name = self.nodes[row] if 0 <= row < len(self.nodes) else "auto"
+            if name == "auto":
+                ok = await set_proxy("auto")
+                self.log_inject("已切到自动模式" if ok else "切换失败")
+            else:
+                ok = await set_proxy(name)
+                self.log_inject("已切换到: %s" % name if ok else "切换失败")
+        self.ui_mode = "normal"
+        self.edit_target = None
+        self.query_one("#node-table").blur()
+        await self.refresh_once()
+
+    def save_and_exit(self):
+        proxy = self.state.get("proxy", "auto")
+        mode = "auto" if proxy == "auto" else "manual"
+        node = proxy if mode == "manual" else self.cfg.get("node", "vless-v6")
+        self.cfg["mode"] = mode
+        self.cfg["node"] = node
+        save_config(self.cfg)
+        self.exit()
+
+    # ---------- 按键 ----------
+    def on_key(self, event):
+        key = event.key
+        char = event.character
+        if self.ui_mode == "command":
+            if key == "escape":
+                self.ui_mode = "normal"
+                self.cmd_buf = ""
+            elif key == "enter":
+                self.exec_command(self.cmd_buf)
+                return
+            elif key == "backspace":
+                self.cmd_buf = self.cmd_buf[:-1]
+            elif char and char.isprintable():
+                self.cmd_buf += char
+            self.refresh_panels()
+            return
+        if self.ui_mode == "edit":
+            if key == "escape":
+                self.ui_mode = "normal"
+                self.edit_target = None
+                self.query_one("#node-table").blur()
+            elif key in ("up", "down"):
+                if self.edit_target == "mode":
+                    d = 1 if key == "down" else -1
+                    self.mode_sel = (self.mode_sel + d) % 2
+                # edit_target == "node" 时 ↑↓ 由 DataTable 处理（聚焦）
+            elif key == "enter":
+                asyncio.create_task(self.confirm_edit())
+                return
+            self.refresh_panels()
+            return
+        # normal
+        if char == ":":
+            self.ui_mode = "command"
+            self.cmd_buf = ""
+        elif key == "up":
+            self.focus_idx = (self.focus_idx - 1) % len(MODULES)
+        elif key == "down":
+            self.focus_idx = (self.focus_idx + 1) % len(MODULES)
+        elif key == "q":
+            self.exit()
+            return
+        self.refresh_panels()
+
+    # ---------- 鼠标（滚轮仅日志） ----------
+    def on_mouse_scroll_down(self, event):
+        log = self.query_one("#log", RichLog)
+        if log.is_vertical_scroll_end:
+            self.log_follow = True
+            log.auto_scroll = True
+        else:
+            self.log_follow = False
+            log.auto_scroll = False
+
+    def on_mouse_scroll_up(self, event):
+        self.log_follow = False
+        self.query_one("#log", RichLog).auto_scroll = False
+
+
+if __name__ == "__main__":
+    SingboxApp().run()
