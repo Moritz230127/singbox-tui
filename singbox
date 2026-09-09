@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# singbox — 代理系统统一命令行控制 (替代 TUI)
+# 用法:
+#   singbox status              服务/节点/出口状态
+#   singbox switch <node>       切换节点 (auto/vless-v6/vless-v4/...)
+#   singbox mode [auto|manual]  查看/切换模式
+#   singbox nodes               节点列表+延迟
+#   singbox speed               下载测速 (经7897)
+#   singbox udp                 国际UDP链路丢包检测
+#   singbox start|stop|restart  服务控制
+#   singbox rules               更新规则集
+#   singbox backup              VPS 配置备份
+#   singbox subscribe [--apply] 节点订阅同步(默认仅检测, --apply 应用)
+#   singbox env                 环境自适应检测
+#   singbox log [n]             最近日志
+#   singbox guard               健康守卫(手动触发)
+#   singbox sec                 安全检查
+#   singbox tui                 启动 TUI
+set -uo pipefail
+
+API="http://127.0.0.1:9090"
+SECRET="$(cat "$HOME/.config/singbox-tui.secret" 2>/dev/null || cat /etc/sing-box/clash-secret 2>/dev/null || true)"
+AUTH=(-H "Authorization: Bearer $SECRET")
+H="$HOME/.local/bin"
+VPS_IP="$(jq -r '.vps_ip // "157.254.187.204"' "$HOME/.config/singbox-tui/config.json" 2>/dev/null || echo 157.254.187.204)"
+
+api_get() { curl -s --max-time 5 "${AUTH[@]}" "$API$1" 2>/dev/null; }
+api_put() { curl -s -X PUT --max-time 5 "${AUTH[@]}" "$API$1" -d "$2" >/dev/null 2>&1; }
+
+cmd="${1:-status}"; shift || true
+
+case "$cmd" in
+  status)
+    st=$(systemctl is-active sing-box 2>/dev/null || echo inactive)
+    echo "服务: $st"
+    if [ "$st" = "active" ]; then
+      p=$(api_get /proxies/proxy | jq -r '.now // "—"' 2>/dev/null)
+      a=$(api_get /proxies/auto | jq -r '.now // "—"' 2>/dev/null)
+      e=$(curl -s --noproxy '*' --max-time 6 -4 https://api.ipify.org 2>/dev/null || echo "—")
+      c=$(ss -tn 2>/dev/null | grep -c "$VPS_IP" || true)
+      err=$(journalctl -u sing-box --since "10 minutes ago" --no-pager 2>/dev/null | grep -cE "ERROR|WARNING" || true)
+      echo "节点: $p (auto 组选中: $a)"
+      echo "出口: $e | VPS 连接: $c | 近10分钟错误: $err"
+    fi
+    ;;
+  switch)
+    node="${1:-auto}"
+    if api_put /proxies/proxy "{\"name\":\"$node\"}"; then
+      echo "✓ 已切换到: $node"
+    else
+      echo "✗ 切换失败 (服务未运行?)"; exit 1
+    fi
+    ;;
+  mode)
+    mode="${1:-}"
+    if [ -z "$mode" ]; then
+      p=$(api_get /proxies/proxy | jq -r '.now // "—"' 2>/dev/null)
+      if [ "$p" = "auto" ]; then echo "当前模式: 自动"; else echo "当前模式: 手动 ($p)"; fi
+    elif [ "$mode" = "auto" ]; then
+      if api_put /proxies/proxy '{"name":"auto"}'; then echo "✓ 已切换到自动模式"; else echo "✗ 切换失败"; exit 1; fi
+    elif [ "$mode" = "manual" ]; then
+      p=$(api_get /proxies/proxy | jq -r '.now // "—"' 2>/dev/null)
+      if [ "$p" = "auto" ]; then
+        # 手动模式需要指定一个具体节点；默认取配置里的 node
+        node=$(jq -r '.node // "vless-v6"' "$HOME/.config/singbox-tui/config.json" 2>/dev/null || echo vless-v6)
+        if api_put /proxies/proxy "{\"name\":\"$node\"}"; then echo "✓ 已切换到手动模式: $node"; else echo "✗ 切换失败"; exit 1; fi
+      else
+        echo "✓ 当前已是手动模式: $p"
+      fi
+    else
+      echo "用法: singbox mode [auto|manual]"; exit 1
+    fi
+    ;;
+  nodes)
+    nodes=$(api_get /proxies/proxy | jq -r '.all[]' 2>/dev/null)
+    if [ -z "$nodes" ]; then
+      nodes="auto vless-v6 vless-v4 tuic-v6 tuic-v4 hy2-v6 hy2-v4"
+    fi
+    cur=$(api_get /proxies/proxy | jq -r '.now // ""' 2>/dev/null)
+    for n in $nodes; do
+      d=$(api_get "/proxies/$n/delay?timeout=5000&url=http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204" | jq -r '.delay // empty' 2>/dev/null)
+      mark=" "
+      [ "$n" = "$cur" ] && mark="*"
+      if [ -n "$d" ]; then
+        printf " %s %-12s %s ms\n" "$mark" "$n" "$d"
+      else
+        printf " %s %-12s —\n" "$mark" "$n"
+      fi
+    done
+    ;;
+  speed)
+    curl -s -x http://127.0.0.1:7897 --max-time 30 -o /dev/null -w "Cloudflare 20MB: %{speed_download} B/s (%{time_total}s)\n" "https://speed.cloudflare.com/__down?bytes=20000000"
+    ;;
+  udp)
+    "$H/singbox-udp-health" 8
+    ;;
+  start|stop|restart)
+    sudo -n systemctl "$cmd" sing-box && echo "✓ sing-box $cmd"
+    ;;
+  rules)
+    "$H/singbox-rules-update"
+    ;;
+  backup)
+    "$H/singbox-vps-backup"
+    ;;
+  subscribe)
+    "$H/singbox-subscribe" "${1:+--apply}"
+    ;;
+  env)
+    sudo -n /usr/local/bin/singbox-env-detect
+    ;;
+  log)
+    n="${1:-10}"
+    journalctl -u sing-box -n "$n" --no-pager 2>/dev/null | grep -vE "block\[block\]" | tail -"$n"
+    ;;
+  guard)
+    "$H/singbox-healthguard" && echo "✓ 守卫已执行"
+    ;;
+  sec)
+    "$H/singbox-sec-check"
+    ;;
+  tui)
+    exec "$H/singbox-tui"
+    ;;
+  *)
+    echo "未知命令: $cmd"; grep -E "^#   singbox" "$0" | head -20
+    ;;
+esac

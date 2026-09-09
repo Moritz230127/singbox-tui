@@ -1,6 +1,6 @@
 # singbox-tui
 
-A terminal control console for the [sing-box](https://sing-box.sagernet.org/) proxy, built with [Textual](https://textual.textualize.io/). Vim-mode interaction, btop-style UI, full control and inspection of your self-hosted proxy.
+A terminal control console for the [sing-box](https://sing-box.sagernet.org/) proxy, built with [Textual](https://textual.textualize.io/). Vim-mode interaction, Catppuccin-style UI, full control and inspection of your self-hosted proxy.
 
 ## Features
 
@@ -8,9 +8,10 @@ A terminal control console for the [sing-box](https://sing-box.sagernet.org/) pr
 - **Single-screen 4-panel layout**: status indicator | control | traffic | node table (DataTable) + real-time log
 - **Node management**: DataTable with node name / server IP / ping (VPS direct) / link latency (via proxy) / download speed; `:node` to select, Enter to switch
 - **Full control** (companion script integration): `:start` `:stop` `:mode` `:node` `:speed` `:iface` `:subscribe` `:backup` `:rules-update` `:udp` `:env` `:guard`
-- **Monitoring**: real-time traffic rate + cumulative totals, egress IP, error/connection counts, uptime, block-reject counter
+- **Monitoring**: real-time traffic rate + session cumulative totals, egress IP, error/connection counts, uptime, block-reject counter
 - **Log**: real-time scroll, ERROR red / WARNING yellow, block-reject lines filtered (counted, not displayed), `:log error|warn|all` filter
-- **btop-style UI**: rounded borders, border titles, noctalia color theme, full fr responsive (all panels scale with terminal width)
+- **Catppuccin-style UI**: rounded borders, border titles, modern color theme, full fr responsive (all panels scale with terminal width)
+- **Performance**: local Clash API via `urllib + asyncio.to_thread`, hierarchical polling (light 3s / heavy 15s), DataTable incremental rendering, persistent `/traffic` stream
 - **Terminal too small guard**: width < 100 or height < 20 shows a hint instead of a broken layout
 
 ## Requirements
@@ -19,22 +20,68 @@ A terminal control console for the [sing-box](https://sing-box.sagernet.org/) pr
 - [textual](https://pypi.org/project/textual/) (Arch: `sudo pacman -S python-textual`)
 - sing-box running with clash API on `127.0.0.1:9090` (mixed proxy on `127.0.0.1:7897`)
 - Optional companion scripts: `singbox-switch-iface`, `singbox-subscribe`, `singbox-vps-backup`, `singbox-rules-update`, `singbox-udp-health`, `singbox-env-detect`, `singbox` (guard)
+- `jq` for the `singbox` CLI
 
 ## Install
 
 ```bash
-sudo pacman -S python-textual
+sudo pacman -S python-textual jq
 cp singbox-tui ~/.local/bin/
-chmod +x ~/.local/bin/singbox-tui
+cp singbox ~/.local/bin/
+chmod +x ~/.local/bin/singbox-tui ~/.local/bin/singbox
 ```
 
+Optional fish aliases:
+
+```fish
+source fish-aliases.fish
+```
+
+Or append the contents of `fish-aliases.fish` to `~/.config/fish/config.fish`.
+
 ## Usage
+
+### TUI
 
 ```bash
 singbox-tui
 ```
 
-### Commands
+### Quick CLI
+
+```bash
+singbox status
+singbox switch vless-v6
+singbox mode auto
+singbox nodes
+singbox speed
+singbox log
+singbox tui
+```
+
+With fish aliases:
+
+```fish
+sb-tui          # 启动 TUI
+sb-status       # 服务/节点/出口状态
+sb-on           # 开启代理
+sb-off          # 关闭代理
+sb-restart      # 重启代理
+sb-switch <节点> # 切换节点
+sb-mode         # 查看/切换模式
+sb-nodes        # 节点列表 + 延迟
+sb-speed        # 快速测速
+sb-udp          # UDP 链路检测
+sb-log          # 最近日志
+sb-rules        # 更新规则集
+sb-backup       # VPS 备份
+sb-sub          # 订阅同步
+sb-env          # 环境检测
+sb-guard        # 健康守卫
+sb-sec          # 安全检查
+```
+
+### TUI Commands
 
 | Command | Function |
 | --- | --- |
